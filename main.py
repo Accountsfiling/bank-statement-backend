@@ -89,15 +89,36 @@ COLUMN_KEYWORDS = {
         "chq", "ref no", "reference", "cheque no", "chq/ref no", "ref number",
         "instrument no", "instrument number",
     ],
-    "debit": ["debit", "withdrawal", "withdrawal amt", "dr", "withdrawal amount"],
-    "credit": ["credit", "deposit", "deposit amt", "cr", "deposit amount"],
+    "debit": ["debit", "withdrawal", "withdrawals", "withdrawal amt", "dr", "withdrawal amount"],
+    "credit": ["credit", "deposit", "deposits", "deposit amt", "cr", "deposit amount"],
     "amount": ["amount"],  # some banks use a single Amount + Dr/Cr indicator column
     "balance": ["balance", "closing balance", "running balance", "available balance"],
+    # Real IDBI Bank net-banking statement export prints "S.No" as its own
+    # leading column before the date. It carries no useful data, but it
+    # still needs to be recognized and given its own column boundary —
+    # otherwise its values have nowhere to go but bleed into the Date
+    # column right next to it (confirmed with a real IDBI statement: the
+    # Date cell came out as "1 13/06/2025 09:32:45", with the leading "1"
+    # being the S.No value). Never read by parse_page_set — same
+    # deliberately-dropped treatment as a non-primary duplicate column.
+    "serial": ["s.no", "sr.no", "sr no", "sl.no", "sl no", "serial no", "serial number"],
 }
 
 DATE_RE = re.compile(
     r"^\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}$"
 )
+# Same shape as DATE_RE but without the end anchor — a real IDBI statement
+# prints a transaction time right after the date IN THE SAME cell ("Txn
+# Date" and "Value Date" have no separate time column, e.g. cell text ends
+# up as "13/06/2025 09:32:45"), which DATE_RE's exact-length match rejects
+# outright. Used only for the "does this line start a new row" decision in
+# parse_page_set — the row's stored date value is left exactly as extracted
+# (date + time together), this just recognizes it as a real date so the row
+# isn't dropped or wrongly merged into the previous one.
+DATE_PREFIX_RE = re.compile(
+    r"^\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}"
+)
+TIME_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
 AMOUNT_RE = re.compile(r"^[\d,]+\.\d{2}$|^[\d,]+$")
 # Stricter than AMOUNT_RE: requires the two-decimal-places shape every real
 # amount in an Indian bank statement actually has ("3,500.00"). Used only to
@@ -109,6 +130,8 @@ AMOUNT_RE = re.compile(r"^[\d,]+\.\d{2}$|^[\d,]+$")
 # see the "Known limitations" note in README.md), and without this stricter
 # check that stray digit string alone was enough to fabricate a bogus row.
 REAL_AMOUNT_RE = re.compile(r"^[\d,]+\.\d{2}$")
+# A bare small integer — what a genuine S.No/serial-number cell looks like.
+SERIAL_RE = re.compile(r"^\d{1,6}$")
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +234,7 @@ def group_into_lines(words, y_tolerance=3.0):
          "words": sorted(line, key=lambda w: w["x0"])}
         for line in lines
     ]
+
 
 def merge_header_tokens(line_words, x_gap=8.0):
     """Merge adjacent words on the header line into label groups, so a
@@ -337,25 +361,53 @@ def _mark_primary_columns(typed):
         chosen["primary"] = True
 
 
+MAX_HEADER_LINES = 3
+# How close together (in PDF points) consecutive lines need to be to be
+# treated as parts of the SAME multi-line header block, rather than two
+# unrelated lines that each happen to carry a recognizable label. Confirmed
+# real with an IDBI Bank statement, whose header is genuinely split across
+# three separate visual lines — "Withdrawals Deposits Balance", then
+# "S.No Txn Date Value Date Description Cheque No", then "(Dr) (Cr)
+# (INR)" — none of which alone contains a date + amount + narration label,
+# so the old single-line-only scan fell through to the freeform fallback
+# and produced garbage. Measured on that real header: consecutive header
+# lines sit ~4pt apart, while the nearest unrelated line above it (the
+# statement's own date-range line) sits ~39pt away, and the first real
+# transaction row sits ~12pt below the header's last line — 6.0 sits
+# safely between the two.
+HEADER_LINE_MERGE_GAP = 6.0
+
+
 def find_header_and_columns(lines):
     """Scan lines for the one that looks like a table header (contains a
-    Date-ish label plus at least one amount-ish label). Returns
-    (header_line_index, [{type, x0, x1, label, primary}, ...]) or
+    Date-ish label plus at least one amount-ish label), trying not just
+    each line alone but also up to MAX_HEADER_LINES consecutive lines
+    merged together when they sit close enough vertically to plausibly be
+    one multi-line header block (see HEADER_LINE_MERGE_GAP). Returns
+    (last_header_line_index, [{type, x0, x1, label, primary}, ...]) or
     (None, None)."""
-    for idx, line in enumerate(lines):
-        groups = merge_header_tokens(line["words"])
+    for idx in range(len(lines)):
         typed = []
-        for g in groups:
-            t = match_column_type(g["label"])
-            if t:
-                typed.append({"type": t, "x0": g["x0"], "x1": g["x1"], "label": g["label"]})
-        types_found = {c["type"] for c in typed}
-        has_date = "date" in types_found
-        has_amount = bool(types_found & {"debit", "credit", "amount", "balance"})
-        has_narration = "narration" in types_found
-        if has_date and has_amount and has_narration:
-            _mark_primary_columns(typed)
-            return idx, sorted(typed, key=lambda c: c["x0"])
+        prev_top = None
+        for offset in range(MAX_HEADER_LINES):
+            li = idx + offset
+            if li >= len(lines):
+                break
+            if offset > 0 and lines[li]["top"] - prev_top > HEADER_LINE_MERGE_GAP:
+                break  # too far from the previous line — not the same header block
+            prev_top = lines[li]["top"]
+            groups = merge_header_tokens(lines[li]["words"])
+            for g in groups:
+                t = match_column_type(g["label"])
+                if t:
+                    typed.append({"type": t, "x0": g["x0"], "x1": g["x1"], "label": g["label"]})
+            types_found = {c["type"] for c in typed}
+            has_date = "date" in types_found
+            has_amount = bool(types_found & {"debit", "credit", "amount", "balance"})
+            has_narration = "narration" in types_found
+            if has_date and has_amount and has_narration:
+                _mark_primary_columns(typed)
+                return li, sorted(typed, key=lambda c: c["x0"])
     return None, None
 
 
@@ -373,6 +425,7 @@ def column_boundaries(columns):
             edges.append(float("inf"))
     return edges
 
+
 _NUMERIC_COLUMN_TYPES = {"debit", "credit", "amount", "balance"}
 # The various ways a bank prints "nothing here" in a debit/credit cell.
 # "NA" is confirmed real — an actual ICICI statement screenshot the user
@@ -389,6 +442,21 @@ def _looks_like_real_amount_word(text):
     if text.strip().lower() in _NUMERIC_PLACEHOLDER_VALUES:
         return True
     return bool(REAL_AMOUNT_RE.match(text.replace(",", "")))
+
+
+def _looks_like_serial_word(text):
+    """True for a bare small integer — a genuine S.No/serial-number cell."""
+    return bool(SERIAL_RE.match(text.strip()))
+
+
+def _looks_like_date_or_time_word(text):
+    """True for something that genuinely belongs in a date-type cell: a
+    real date, or a time printed alongside it in the same cell (confirmed
+    real: a real IDBI statement has no separate time column — "Txn Date"
+    and "Value Date" each carry a date and a time as two words on the same
+    line, e.g. "13/06/2025" then "09:32:45")."""
+    t = text.strip()
+    return bool(DATE_PREFIX_RE.match(t)) or bool(TIME_RE.match(t))
 
 
 def assign_line_to_columns(line_words, columns):
@@ -416,7 +484,21 @@ def assign_line_to_columns(line_words, columns):
     neighbouring Debit column, corrupting real transaction data rather
     than just an odd word placement between two text columns. Guarding on
     "does this actually look like an amount" catches that without needing
-    real column-grid detection."""
+    real column-grid detection.
+
+    The opposite can also happen at the START of a row: a column's data can
+    start further LEFT than its own header label, encroaching on whatever
+    sits before it. Confirmed real with the same IDBI statement: its
+    leading "S.No" column has no real data width to speak of, and the date
+    column right after it prints its actual date value well to the left of
+    where the "Txn Date"/"Value Date" labels themselves start — so by
+    x-position alone, a serial number can land in the date cell (corrupting
+    it — the whole reason S.No is tracked as its own "serial" column at
+    all) while the real date, or even wrapped narration text from the
+    column after THAT, can land one column too early. A word landing in a
+    "serial" cell that isn't a bare small number, or in a "date" cell that
+    isn't a date/time, is walked forward instead — the mirror image of the
+    guard above."""
     edges = column_boundaries(columns)
     key_for = [
         c["type"] if c.get("primary", True) else f"_dup_{c['type']}_{i}"
@@ -433,6 +515,11 @@ def assign_line_to_columns(line_words, columns):
             and not _looks_like_real_amount_word(w["text"])
         ):
             idx -= 1
+        while idx < len(columns) - 1 and (
+            (columns[idx]["type"] == "serial" and not _looks_like_serial_word(w["text"]))
+            or (columns[idx]["type"] == "date" and not _looks_like_date_or_time_word(w["text"]))
+        ):
+            idx += 1
         cells[key_for[idx]].append(w["text"])
     return {t: " ".join(v).strip() for t, v in cells.items()}
 
@@ -446,6 +533,19 @@ def clean_amount(s: str):
     if not AMOUNT_RE.match(s.replace(",", "")):
         return s  # leave as-is; better to show raw than silently drop data
     return s
+
+
+MAX_ROW_LINE_GAP = 24.0
+# Confirmed real with an IDBI statement: every page ends with a footer
+# block ("IDBI Bank Ltd. Regd. Office...", "Page X of Y") separated from
+# the last real transaction line by a distinctly larger vertical gap
+# (measured ~33-39pt) than any gap seen between two genuine transaction
+# lines on the same page (a continuation line sits ~6-8pt below the line
+# it wraps from; two different transactions' first lines sit ~11-18pt
+# apart) — 24.0 sits safely between those two ranges. Without this, the
+# footer's own lines have no date and get silently appended as if they
+# were more wrapped narration/ref text for whatever the last real
+# transaction happened to be.
 
 
 def parse_page_set(all_lines_by_page):
@@ -473,15 +573,45 @@ def parse_page_set(all_lines_by_page):
         if columns is None:
             continue
 
+        prev_top = None
+        # Whether a row has actually been added FROM THIS PAGE yet. A
+        # dateless line can only be a continuation of a row that started on
+        # THIS page — never one carried over from the previous page.
+        # Confirmed real and necessary: this statement's closing page is
+        # pure "Statement Summary" / legends / disclaimer text with no
+        # transactions and no repeated header at all, so every one of its
+        # lines is dateless — without this guard, all of it silently
+        # attached itself to the last real transaction from the page
+        # before, producing one transaction row with several paragraphs of
+        # legal boilerplate stuffed into its narration.
+        page_added_row = False
+
         for line in page_lines[start_idx:]:
+            if prev_top is not None and line["top"] - prev_top > MAX_ROW_LINE_GAP:
+                break  # end of the transaction table for this page — the rest is footer/disclaimer text
+            prev_top = line["top"]
             cell = assign_line_to_columns(line["words"], columns)
             date_val = cell.get("date", "").strip()
-            has_real_date = bool(DATE_RE.match(date_val))
-            any_amount = any(
+            has_real_date = bool(DATE_PREFIX_RE.match(date_val))
+            # Only debit/credit/amount define a NEW row on a dateless line —
+            # deliberately excludes "balance". Confirmed real with an IDBI
+            # statement whose running balance sometimes wraps onto its own
+            # line with nothing else on it (the date+narration+debit/credit
+            # line runs too long, so just the balance number spills onto a
+            # line by itself). That line has no date and no debit/credit/
+            # amount, but it DOES have a real amount (the balance) — with
+            # balance counted here, this dateless-but-has-an-amount line
+            # was wrongly treated as the start of a brand new transaction,
+            # producing a spurious extra row with the previous transaction's
+            # balance and none of its own narration, while the real row lost
+            # its balance entirely. A genuine new transaction with no date on
+            # its first line still always carries a debit/credit/amount;
+            # balance-only is the signature of a wrapped balance instead.
+            has_txn_amount = any(
                 REAL_AMOUNT_RE.match(cell.get(k, "").strip())
-                for k in ("debit", "credit", "amount", "balance")
+                for k in ("debit", "credit", "amount")
             )
-            if has_real_date or (any_amount and rows):
+            if has_real_date or (has_txn_amount and rows):
                 row = {
                     "date": date_val,
                     "narration": cell.get("narration", "").strip(),
@@ -492,15 +622,23 @@ def parse_page_set(all_lines_by_page):
                     "balance": clean_amount(cell.get("balance", "")),
                 }
                 rows.append(row)
+                page_added_row = True
             else:
-                # continuation of the previous row (wrapped narration/ref text)
-                if rows:
+                # continuation of the previous row (wrapped narration/ref
+                # text, and/or a wrapped balance value — see above) — only
+                # when that previous row actually started on this same page.
+                if rows and page_added_row:
                     for k in ("narration", "ref"):
                         extra = cell.get(k, "").strip()
                         if extra:
                             rows[-1][k] = (rows[-1][k] + " " + extra).strip()
+                    if not rows[-1]["balance"]:
+                        extra_balance = clean_amount(cell.get("balance", ""))
+                        if extra_balance:
+                            rows[-1]["balance"] = extra_balance
 
     return columns, rows
+
 
 # ---------------------------------------------------------------------------
 # Fallback for statements with no detectable table header at all — some
@@ -621,6 +759,7 @@ def parse_freeform_lines(all_lines_by_page):
             if rest:
                 _apply_freeform_fragment(row, rest)
     return rows
+
 
 # ---------------------------------------------------------------------------
 # API
