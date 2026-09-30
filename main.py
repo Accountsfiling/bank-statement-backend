@@ -535,17 +535,35 @@ def clean_amount(s: str):
     return s
 
 
-MAX_ROW_LINE_GAP = 24.0
+MAX_ROW_LINE_GAP = 29.0
 # Confirmed real with an IDBI statement: every page ends with a footer
 # block ("IDBI Bank Ltd. Regd. Office...", "Page X of Y") separated from
 # the last real transaction line by a distinctly larger vertical gap
-# (measured ~33-39pt) than any gap seen between two genuine transaction
-# lines on the same page (a continuation line sits ~6-8pt below the line
-# it wraps from; two different transactions' first lines sit ~11-18pt
-# apart) — 24.0 sits safely between those two ranges. Without this, the
-# footer's own lines have no date and get silently appended as if they
-# were more wrapped narration/ref text for whatever the last real
-# transaction happened to be.
+# (measured ~33-39pt there) than any gap seen between two genuine
+# transaction lines on that same statement (a continuation line sits ~6-8pt
+# below the line it wraps from; two different transactions' first lines sit
+# ~11-18pt apart). Without this, the footer's own lines have no date and
+# get silently appended as if they were more wrapped narration/ref text for
+# whatever the last real transaction happened to be.
+#
+# Originally set to 24.0, which sat safely between IDBI's own numbers but
+# turned out too tight once a second real statement was tested: a real
+# IDFC FIRST Bank statement has a genuine narration-wrap gap of up to
+# ~24.1pt between two lines of the SAME wrapped transaction (this bank's
+# line spacing runs a bit taller than IDBI's), which tripped the old 24.0
+# threshold as if it were the page's footer boundary — silently truncating
+# every real transaction after that point on the page, on every affected
+# page. Confirmed by direct measurement across the entire real 22-page
+# IDFC document: 24.1pt is its true maximum in-table gap, and its footer
+# boundary gap is never smaller than ~90pt on any page that still has real
+# transaction data (one page that's pure disclaimer/legend text with no
+# transactions at all has a smaller ~25.4pt footer-entry gap, but that's
+# harmless to miss here — with no transaction ever added on that page,
+# there's nothing for a missed break to wrongly merge). 29.0 sits with
+# margin on both sides of the two real statements measured so far: above
+# both banks' real in-table maximums (18pt IDBI, 24.1pt IDFC) and below
+# IDBI's own real footer minimum (33.6pt) — the number to revisit if a
+# future real statement's line spacing runs even taller than IDFC's.
 
 
 def parse_page_set(all_lines_by_page):
@@ -565,10 +583,32 @@ def parse_page_set(all_lines_by_page):
                 columns = cols
                 start_idx = header_idx + 1
         else:
-            # if this page repeats a header line, skip it
+            # If this page repeats the header, skip past it — wherever it
+            # actually falls, not just when it sits at line 0. Confirmed
+            # real and necessary with an IDFC FIRST Bank statement: every
+            # continuation page reprints ~4 lines of boilerplate
+            # ("STATEMENT OF ACCOUNT" / customer ID / account no /
+            # statement period) plus an opening-balance summary line BEFORE
+            # the actual "Value Date / Particulars / Debit / Credit /
+            # Balance" header — unlike the IDBI statement this repeated-
+            # header check was originally written for, whose header sat
+            # right at the top of every page. With the old `header_idx == 0`
+            # check, that never matched here, so `start_idx` stayed 0 and
+            # MAX_ROW_LINE_GAP's footer/gap guard (correctly meant to stop
+            # at a page's trailing footer) instead tripped on the ~55pt gap
+            # between the boilerplate and the balance-summary line — a gap
+            # that occurs before any real data has even been reached — and
+            # silently discarded the ENTIRE rest of every continuation page.
+            # That's why a real 22-page/many-transaction IDFC statement came
+            # back with only the 6 transactions that happened to be on page
+            # 1 (the only page whose header sits at the very top of the
+            # all-lines list, since there's no earlier boilerplate to skip
+            # past yet). Skipping to wherever the header is actually found —
+            # exactly like the very first page does — fixes this generally,
+            # not just for this one statement's specific boilerplate length.
             header_idx, cols = find_header_and_columns(page_lines)
-            if cols and header_idx == 0:
-                start_idx = 1
+            if cols:
+                start_idx = header_idx + 1
 
         if columns is None:
             continue
