@@ -433,15 +433,55 @@ _NUMERIC_COLUMN_TYPES = {"debit", "credit", "amount", "balance"}
 # didn't apply to a row.
 _NUMERIC_PLACEHOLDER_VALUES = {"-", "--", "na", "n.a", "n.a.", "nil"}
 
+# A bare Cr/Dr balance-sign marker — confirmed real with a Bank of Baroda
+# statement, which prints its running balance as a plain number followed by
+# "Cr" (positive) or "Dr" (overdrawn/negative), e.g. "37549.63 Cr" or
+# "390052.48 Dr", as two separate words rather than one combined cell. Before
+# this was recognised as valid numeric-column content, the leftward-overflow
+# guard below walked it backward out of the balance column entirely (since
+# it doesn't look like an amount on its own) — straight past Debit/Credit —
+# into the non-numeric ref/CHQ.NO. column, polluting nearly every row's ref
+# field with a stray "Cr". See clean_amount() for where the actual sign
+# conversion happens.
+_CR_DR_WORD_RE = re.compile(r"^(?:cr|dr)$", re.IGNORECASE)
+
+# A comma used where a decimal point belongs — confirmed real (3 occurrences
+# across a 6-page Bank of Baroda statement), e.g. "37549,63" instead of
+# "37549.63", always in the balance column. See _normalize_amount_token().
+_COMMA_DECIMAL_RE = re.compile(r"^(\d[\d,]*),(\d{2})$")
+
+
+def _normalize_amount_token(text):
+    """Fix a token whose decimal point was rendered as a comma instead of a
+    period. A trailing ",DD" (exactly two digits) with no period anywhere in
+    the token can never be a legitimate Indian-style thousands separator —
+    that always groups the rightmost segment as exactly THREE digits (e.g.
+    "1,23,456"), never two — so seeing exactly two digits after the last
+    comma, with no period in the token at all, is unambiguous proof of a
+    corrupted decimal point rather than a real thousands comma. Leaves
+    everything else (ordinary text, properly formatted amounts, genuine
+    comma-grouped integers) untouched."""
+    t = text.strip()
+    if "." in t:
+        return text
+    m = _COMMA_DECIMAL_RE.match(t)
+    if not m:
+        return text
+    return f"{m.group(1)}.{m.group(2)}"
+
 
 def _looks_like_real_amount_word(text):
     """True for something that genuinely belongs in a debit/credit/amount/
     balance cell: a properly formatted amount (comma-separated, two decimal
-    places — every real amount in these statements has this shape) or one
-    of the usual "nil" placeholder marks banks print for an empty cell."""
-    if text.strip().lower() in _NUMERIC_PLACEHOLDER_VALUES:
+    places — every real amount in these statements has this shape), one of
+    the usual "nil" placeholder marks banks print for an empty cell, or a
+    bare Cr/Dr balance-sign marker (see _CR_DR_WORD_RE above)."""
+    t = text.strip()
+    if t.lower() in _NUMERIC_PLACEHOLDER_VALUES:
         return True
-    return bool(REAL_AMOUNT_RE.match(text.replace(",", "")))
+    if _CR_DR_WORD_RE.match(t):
+        return True
+    return bool(REAL_AMOUNT_RE.match(t.replace(",", "")))
 
 
 def _looks_like_serial_word(text):
@@ -506,28 +546,63 @@ def assign_line_to_columns(line_words, columns):
     ]
     cells = {k: [] for k in key_for}
     for w in line_words:
+        # Fix a comma-for-decimal-point rendering glitch (see
+        # _normalize_amount_token) before any shape check runs, so both the
+        # recognition logic below and the stored cell value see the
+        # corrected text.
+        text = _normalize_amount_token(w["text"])
         idx = 0
         while idx < len(edges) - 1 and w["x0"] >= edges[idx]:
             idx += 1
         while (
             idx > 0
             and columns[idx]["type"] in _NUMERIC_COLUMN_TYPES
-            and not _looks_like_real_amount_word(w["text"])
+            and not _looks_like_real_amount_word(text)
         ):
             idx -= 1
         while idx < len(columns) - 1 and (
-            (columns[idx]["type"] == "serial" and not _looks_like_serial_word(w["text"]))
-            or (columns[idx]["type"] == "date" and not _looks_like_date_or_time_word(w["text"]))
+            (columns[idx]["type"] == "serial" and not _looks_like_serial_word(text))
+            or (columns[idx]["type"] == "date" and not _looks_like_date_or_time_word(text))
         ):
             idx += 1
-        cells[key_for[idx]].append(w["text"])
+        cells[key_for[idx]].append(text)
     return {t: " ".join(v).strip() for t, v in cells.items()}
+
+
+# A number followed by a Cr/Dr sign marker — e.g. "390052.48 Dr" or
+# "37549.63 Cr". Confirmed real with a Bank of Baroda statement; its sign
+# marker is occasionally duplicated at a second, slightly-offset vertical
+# position (a likely PDF-rendering/duplicate-text-layer artifact specific
+# to this bank's export template), so the suffix group tolerates a repeated
+# "Cr"/"Dr" ("... Dr Dr") rather than assuming exactly one.
+_AMOUNT_WITH_CR_DR_RE = re.compile(
+    r"^([\d,]+(?:\.\d{2})?)\s*((?:dr|cr)(?:\s+(?:dr|cr))*)$", re.IGNORECASE
+)
+# A bare Cr/Dr marker with no digits attached at all — e.g. a continuation
+# line that only ever carried the sign word, or the same duplicate-marker
+# artifact landing on its own. Resolves to "" (see below) rather than being
+# treated as a real value.
+_BARE_CR_DR_RE = re.compile(r"^(?:dr|cr)(?:\s+(?:dr|cr))*$", re.IGNORECASE)
 
 
 def clean_amount(s: str):
     if not s:
         return ""
-    s = s.strip().replace(",", "")
+    s = s.strip()
+    if _BARE_CR_DR_RE.match(s):
+        # Harmless to drop: the "only fill balance if currently empty" merge
+        # guard in parse_page_set treats an empty string exactly like no
+        # value was found on this line at all.
+        return ""
+    m = _AMOUNT_WITH_CR_DR_RE.match(s)
+    if m:
+        digits, suffix = m.group(1), m.group(2)
+        is_dr = "dr" in suffix.lower()
+        digits = digits.replace(",", "")
+        if not AMOUNT_RE.match(digits):
+            return digits  # leave as-is; better to show raw than silently drop data
+        return ("-" + digits) if is_dr else digits
+    s = s.replace(",", "")
     if s == "" or s.lower() in _NUMERIC_PLACEHOLDER_VALUES:
         return ""
     if not AMOUNT_RE.match(s.replace(",", "")):
@@ -564,6 +639,21 @@ MAX_ROW_LINE_GAP = 29.0
 # both banks' real in-table maximums (18pt IDBI, 24.1pt IDFC) and below
 # IDBI's own real footer minimum (33.6pt) — the number to revisit if a
 # future real statement's line spacing runs even taller than IDFC's.
+
+
+def _next_date_top(page_lines, after_idx, columns, max_lookahead=4):
+    """Scan forward from after_idx (exclusive) up to max_lookahead lines for
+    the next one whose date cell is a real date, and return its `top`
+    (None if none found within the window). Used only to decide whether a
+    dateless line is LEADING narration for the row about to start, rather
+    than TRAILING continuation of the row before it — see the leading-vs-
+    trailing note in parse_page_set."""
+    end = min(after_idx + 1 + max_lookahead, len(page_lines))
+    for j in range(after_idx + 1, end):
+        cand = assign_line_to_columns(page_lines[j]["words"], columns)
+        if DATE_PREFIX_RE.match(cand.get("date", "").strip()):
+            return page_lines[j]["top"]
+    return None
 
 
 def parse_page_set(all_lines_by_page):
@@ -625,8 +715,23 @@ def parse_page_set(all_lines_by_page):
         # before, producing one transaction row with several paragraphs of
         # legal boilerplate stuffed into its narration.
         page_added_row = False
+        # top of the last row-starting date line seen on THIS page — used
+        # below to tell a TRAILING continuation line from a LEADING one.
+        last_date_top = None
+        # Narration/ref text pulled off a dateless line that sits closer to
+        # the NEXT row than to the one before it — held here until that next
+        # row actually gets created, then prepended to it. Confirmed real
+        # and necessary with a Bank of Baroda statement: unlike IDBI/IDFC
+        # (where a wrapped narration line only ever continues AFTER its
+        # row's date+amount line), Bank of Baroda can split a transaction's
+        # narration as a line BEFORE its own date+amount line too, so the
+        # old "every dateless line continues whatever row is currently open"
+        # assumption silently stitched that leading line onto the PREVIOUS
+        # transaction instead of the one it actually belongs to.
+        pending_leading = {"narration": "", "ref": ""}
 
-        for line in page_lines[start_idx:]:
+        for idx in range(start_idx, len(page_lines)):
+            line = page_lines[idx]
             if prev_top is not None and line["top"] - prev_top > MAX_ROW_LINE_GAP:
                 break  # end of the transaction table for this page — the rest is footer/disclaimer text
             prev_top = line["top"]
@@ -661,13 +766,43 @@ def parse_page_set(all_lines_by_page):
                     "amount": clean_amount(cell.get("amount", "")),
                     "balance": clean_amount(cell.get("balance", "")),
                 }
+                if pending_leading["narration"] or pending_leading["ref"]:
+                    for k in ("narration", "ref"):
+                        lead = pending_leading[k].strip()
+                        if lead:
+                            row[k] = (lead + " " + row[k]).strip()
+                    pending_leading = {"narration": "", "ref": ""}
                 rows.append(row)
                 page_added_row = True
+                last_date_top = line["top"]
             else:
-                # continuation of the previous row (wrapped narration/ref
-                # text, and/or a wrapped balance value — see above) — only
-                # when that previous row actually started on this same page.
-                if rows and page_added_row:
+                # A dateless line could be a TRAILING continuation of the
+                # row before it (wrapped narration/ref text, and/or a
+                # wrapped balance value — see above), or — confirmed real
+                # with Bank of Baroda — LEADING narration for the row about
+                # to start. Tell them apart by which neighbouring date line
+                # this one actually sits closer to: IDBI/IDFC's genuine
+                # continuation lines always sit much closer to the
+                # preceding date line than to the next transaction's, so
+                # this preserves their existing behaviour unchanged, while
+                # correctly reclassifying Bank of Baroda's leading lines
+                # (which sit closer to the date line still ahead of them).
+                dist_back = (
+                    (line["top"] - last_date_top) if last_date_top is not None else None
+                )
+                next_top = _next_date_top(page_lines, idx, columns)
+                dist_fwd = (next_top - line["top"]) if next_top is not None else None
+                is_leading = dist_fwd is not None and (
+                    dist_back is None or dist_fwd < dist_back
+                )
+                if is_leading:
+                    for k in ("narration", "ref"):
+                        extra = cell.get(k, "").strip()
+                        if extra:
+                            pending_leading[k] = (pending_leading[k] + " " + extra).strip()
+                elif rows and page_added_row:
+                    # trailing continuation of the previous row — only when
+                    # that previous row actually started on this same page.
                     for k in ("narration", "ref"):
                         extra = cell.get(k, "").strip()
                         if extra:
