@@ -138,6 +138,42 @@ SERIAL_RE = re.compile(r"^\d{1,6}$")
 # Word/line extraction
 # ---------------------------------------------------------------------------
 
+def _is_border_noise(text):
+    """True for a token that is only table-grid-line debris: OCR reads the
+    vertical rules of a bordered statement table as stray "|" tokens (confirmed
+    real on a scanned HDFC statement, where they landed inside the narration
+    and ref cells of most rows). No real statement content is made only of
+    these characters."""
+    return text != "" and all(ch in "|¦" for ch in text)
+
+
+def _pages_have_text_layer(pdf_path, password):
+    """Per-page True/False for "has a real text layer", via poppler's
+    pdftotext (already installed here, since pdf2image needs poppler), or
+    None if that can't be determined for any reason (tool missing, encrypted
+    file, timeout...) — callers then just use their original, slower path.
+    Exists because pdfplumber's own text-extraction pass is surprisingly
+    slow on image-only pages (~2s EACH — it decodes the full-page scan just
+    to discover there's no text on it): 78s of pure waste before OCR even
+    started on a real 43-page scanned statement, vs ~2s for this check."""
+    import subprocess
+
+    cmd = ["pdftotext"]
+    if password:
+        cmd += ["-upw", password]
+    cmd += [pdf_path, "-"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=60)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    pages = out.stdout.decode("utf-8", errors="ignore").split("\f")
+    if pages and pages[-1].strip() == "":
+        pages = pages[:-1]  # pdftotext ends with a trailing form feed
+    return [sum(1 for ch in p if not ch.isspace()) >= 20 for p in pages]
+
+
 def extract_pages_words(pdf_path: str, password: Optional[str]):
     """Return a list of pages, each a list of word dicts:
     {text, x0, x1, top, bottom}. Falls back to OCR for pages with no
@@ -146,13 +182,33 @@ def extract_pages_words(pdf_path: str, password: Optional[str]):
     """
     pages_words = []
     needs_ocr_pages = []
+    # Fast pre-check (poppler's pdftotext, ~2s for a 43-page file) of which
+    # pages carry ANY text layer at all — see _pages_have_text_layer().
+    # None means "couldn't tell", which falls back to the old behaviour.
+    text_flags = _pages_have_text_layer(pdf_path, password)
 
     try:
         with pdfplumber.open(pdf_path, password=password or "") as pdf:
             if len(pdf.pages) > MAX_PAGES:
                 raise ValueError("too_many_pages")
             for i, page in enumerate(pdf.pages):
+                if (
+                    text_flags is not None
+                    and i < len(text_flags)
+                    and not text_flags[i]
+                ):
+                    # confirmed image-only page: skip pdfplumber entirely
+                    pages_words.append(None)
+                    needs_ocr_pages.append(i)
+                    continue
                 words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+                # pdfplumber caches every page it touches (including each
+                # page's decoded images) for the life of the PDF object.
+                # Confirmed real: on a 43-page, 17.9MB image-only scan that
+                # cache alone grew to ~3.4GB — enough to get the process
+                # killed on a small hosted instance — versus ~240MB once
+                # each page's cache is flushed as soon as it's been read.
+                page.flush_cache()
                 text_len = sum(len(w["text"]) for w in words)
                 if text_len < 20:
                     # essentially no text layer -> scanned page, needs OCR
@@ -181,19 +237,32 @@ def extract_pages_words(pdf_path: str, password: Optional[str]):
     if needs_ocr_pages:
         if pytesseract is None:
             raise ValueError("ocr_unavailable")
-        images = convert_from_path(pdf_path, dpi=OCR_DPI, userpw=password or None)
+        # Render and OCR ONE page at a time. The original version rendered
+        # every page up front with a single convert_from_path() call, which
+        # holds every page's full-resolution bitmap in memory at once (~26MB
+        # per A4 page at 300 DPI, before PIL overhead) — fine for a 6-page
+        # scan, but a real 43-page scanned HDFC statement needed >1GB and was
+        # killed by the OS (out-of-memory) before a single word was read, which
+        # on a small hosted instance would take the whole service down for
+        # every user, not just fail one request.
         for i in needs_ocr_pages:
-            if i >= len(images):
+            imgs = convert_from_path(
+                pdf_path, dpi=OCR_DPI, userpw=password or None,
+                first_page=i + 1, last_page=i + 1,
+            )
+            if not imgs:
                 pages_words[i] = []
                 continue
+            image = imgs[0]
             data = pytesseract.image_to_data(
-                images[i], output_type=pytesseract.Output.DICT
+                image, output_type=pytesseract.Output.DICT
             )
+            del imgs, image
             scale = 72.0 / OCR_DPI  # convert pixel coords back to PDF-point scale
             words = []
             for j, text in enumerate(data["text"]):
                 text = text.strip()
-                if not text:
+                if not text or _is_border_noise(text):
                     continue
                 x0 = data["left"][j] * scale
                 y0 = data["top"][j] * scale
@@ -641,33 +710,133 @@ MAX_ROW_LINE_GAP = 29.0
 # future real statement's line spacing runs even taller than IDFC's.
 
 
-def _next_date_top(page_lines, after_idx, columns, max_lookahead=4):
-    """Scan forward from after_idx (exclusive) up to max_lookahead lines for
-    the next one whose date cell is a real date, and return its `top`
-    (None if none found within the window). Used only to decide whether a
-    dateless line is LEADING narration for the row about to start, rather
-    than TRAILING continuation of the row before it — see the leading-vs-
-    trailing note in parse_page_set."""
-    end = min(after_idx + 1 + max_lookahead, len(page_lines))
-    for j in range(after_idx + 1, end):
-        cand = assign_line_to_columns(page_lines[j]["words"], columns)
-        if DATE_PREFIX_RE.match(cand.get("date", "").strip()):
-            return page_lines[j]["top"]
+# A dateless run is split between the row before it and the row after it at
+# its single clearly-largest vertical gap (see _split_dateless_run). How much
+# larger than every other gap in the run that gap must be before it is trusted.
+RUN_SPLIT_DISTINCT_RATIO = 1.25
+
+
+def _split_dateless_run(a_top, run_tops, b_top):
+    """Decide how many of the dateless lines sitting between two row-starting
+    (dated) lines belong to the row ABOVE them (trailing wrap) — the rest
+    belong to the row BELOW (leading narration). Returns k: the first k lines
+    trail the upper row, the remaining len(run_tops)-k lead the lower row.
+
+    Why this exists: banks lay a wrapped narration out in two different
+    ways, and both are confirmed real —
+      * TOP-aligned (IDBI, HDFC): the dated line is the narration's FIRST
+        line, every wrapped line follows it.
+      * CENTRE-aligned (IDFC FIRST, Bank of Baroda): the dated line sits in
+        the MIDDLE of a multi-line narration block, so some narration lines
+        come BEFORE it. IDFC e.g. prints "IMPS/509307268522/" and
+        "ABHIJITRAJENDRA/" above the date line and "ICIC0007304/4765/" /
+        "IMPSTransaction" below it.
+    Both layouts keep the lines of ONE row packed at a small pitch and leave
+    a visibly larger gap BETWEEN two rows' blocks, so the right split is
+    simply the run's single largest gap: top-aligned runs have it last
+    (k = all lines trail), centre-aligned runs have it somewhere inside.
+    If no gap is clearly larger than the rest (uniform spacing), there is no
+    evidence for a leading line, so everything trails — the safe default and
+    the behaviour this tool always had.
+
+    A previous version compared each line's distance to the last dated line
+    against its distance to the next one. That is NOT the same thing and was
+    wrong: the last wrapped line of any multi-line top-aligned narration is
+    always nearer the NEXT row than the previous dated line, so it silently
+    moved narration text onto the wrong transaction — 9 rows of a real IDBI
+    statement and 241 of 248 on a real IDFC one. Amounts were never affected
+    (which is why a balance-reconciliation check didn't catch it)."""
+    m = len(run_tops)
+    if m == 0:
+        return 0
+    tops = [a_top] + list(run_tops) + [b_top]
+    gaps = [tops[i + 1] - tops[i] for i in range(len(tops) - 1)]  # len m+1
+    k = max(range(len(gaps)), key=lambda i: gaps[i])
+    others = [g for i, g in enumerate(gaps) if i != k]
+    if not others or gaps[k] < max(others) * RUN_SPLIT_DISTINCT_RATIO + 0.5:
+        return m
+    return k
+
+
+def _first_line_start_idx(page_lines, columns):
+    """Index of the first line on a page that genuinely starts a transaction:
+    its FIRST word is a date. (Only the date cell being a date isn't enough
+    in header-less mode: page boilerplate such as "From : 01/06/2026 To :
+    30/09/2026" has a date that lands in the date column by x-position.)"""
+    for i, line in enumerate(page_lines):
+        if DATE_RE.match(line["words"][0]["text"].strip()):
+            cell = assign_line_to_columns(line["words"], columns)
+            if DATE_PREFIX_RE.match(cell.get("date", "").strip()):
+                return i
     return None
 
 
-def parse_page_set(all_lines_by_page):
+# A bare "Page 5 6" / "Page 2 of 9" line — a page-number footer. Confirmed
+# real with a Bank of Baroda statement whose footer ("Page N M", then a
+# "Customer Care" line) sits only ~15pt below the last wrapped narration
+# line, i.e. INSIDE the gap guard, so five rows picked up
+# "@ https://www.bankofbaroda.in Customer Care" and "Page 5 6" in narration/ref.
+PAGE_FOOTER_RE = re.compile(
+    r"^\s*page\s*(?:no\.?)?\s*\d+(?:\s*(?:of|/)?\s*\d+)?\s*$", re.IGNORECASE
+)
+
+
+def _line_text(line):
+    return " ".join(w["text"] for w in line["words"]).strip()
+
+
+def _find_repeat_header_blocks(page_lines, from_idx):
+    """(first_idx, last_idx) of every table-header block at/after from_idx.
+    A statement can start a SECOND table mid-page (confirmed real: a Bank of
+    Baroda file whose current-account table ends and an overdraft-account
+    table begins on the same page, each with its own title and header)."""
+    blocks = []
+    pos = from_idx
+    while pos < len(page_lines):
+        li, cols = find_header_and_columns(page_lines[pos:])
+        if not cols:
+            break
+        last = pos + li
+        first = last
+        while (
+            first - 1 >= pos
+            and last - first < MAX_HEADER_LINES - 1
+            and page_lines[first]["top"] - page_lines[first - 1]["top"] <= HEADER_LINE_MERGE_GAP
+            and any(
+                match_column_type(g["label"])
+                for g in merge_header_tokens(page_lines[first - 1]["words"])
+            )
+        ):
+            first -= 1
+        blocks.append((first, last))
+        pos = last + 1
+    return blocks
+
+
+def parse_page_set(all_lines_by_page, columns_override=None):
     """Find the header on whichever page has it, apply those column
     boundaries to every subsequent line across all pages (bank statements
     usually repeat the header per page, but we don't require that), merge
-    continuation lines, and return the row list."""
-    columns = None
+    continuation lines, and return the row list.
+
+    columns_override: a column layout inferred WITHOUT a header (see
+    infer_columns_without_header) — used instead of searching for a header,
+    for scans that start mid-statement. In that mode there is no header to
+    skip past or to bound the table, so each page starts at its first dated
+    line and ends at the first line left of the date column (page footer)."""
+    columns = columns_override
+    headerless = columns_override is not None
     rows = []
-    pending_narration_extra = []
+    last_date_x = None  # x of the most recent row-start date (see Phase 1)
 
     for page_lines in all_lines_by_page:
         start_idx = 0
-        if columns is None:
+        if headerless:
+            first = _first_line_start_idx(page_lines, columns)
+            if first is None:
+                continue
+            start_idx = first
+        elif columns is None:
             header_idx, cols = find_header_and_columns(page_lines)
             if cols:
                 columns = cols
@@ -703,41 +872,57 @@ def parse_page_set(all_lines_by_page):
         if columns is None:
             continue
 
-        prev_top = None
-        # Whether a row has actually been added FROM THIS PAGE yet. A
-        # dateless line can only be a continuation of a row that started on
-        # THIS page — never one carried over from the previous page.
-        # Confirmed real and necessary: this statement's closing page is
-        # pure "Statement Summary" / legends / disclaimer text with no
-        # transactions and no repeated header at all, so every one of its
-        # lines is dateless — without this guard, all of it silently
-        # attached itself to the last real transaction from the page
-        # before, producing one transaction row with several paragraphs of
-        # legal boilerplate stuffed into its narration.
-        page_added_row = False
-        # top of the last row-starting date line seen on THIS page — used
-        # below to tell a TRAILING continuation line from a LEADING one.
-        last_date_top = None
-        # Narration/ref text pulled off a dateless line that sits closer to
-        # the NEXT row than to the one before it — held here until that next
-        # row actually gets created, then prepended to it. Confirmed real
-        # and necessary with a Bank of Baroda statement: unlike IDBI/IDFC
-        # (where a wrapped narration line only ever continues AFTER its
-        # row's date+amount line), Bank of Baroda can split a transaction's
-        # narration as a line BEFORE its own date+amount line too, so the
-        # old "every dateless line continues whatever row is currently open"
-        # assumption silently stitched that leading line onto the PREVIOUS
-        # transaction instead of the one it actually belongs to.
-        pending_leading = {"narration": "", "ref": ""}
+        date_left = columns[0]["x0"]
 
+        # ---- Phase 1: walk the page's table lines, classify each as the
+        # start of a new row or a dateless (wrapped narration / balance) line.
+        entries = []  # (top, cell, is_start)
+        prev_top = None
+        started_here = False
+        header_blocks = {} if headerless else {
+            f: l for f, l in _find_repeat_header_blocks(page_lines, start_idx)
+        }
+        skip_until = -1
         for idx in range(start_idx, len(page_lines)):
             line = page_lines[idx]
+            if idx <= skip_until:
+                continue
+            if idx in header_blocks:
+                # a second table starts here: the dateless lines since the
+                # last row are its title/boilerplate, not narration
+                while entries and not entries[-1][2]:
+                    entries.pop()
+                skip_until = header_blocks[idx]
+                prev_top = None
+                continue
+            if PAGE_FOOTER_RE.match(_line_text(line)):
+                break  # page-number footer: nothing after it is table
             if prev_top is not None and line["top"] - prev_top > MAX_ROW_LINE_GAP:
                 break  # end of the transaction table for this page — the rest is footer/disclaimer text
+            if headerless:
+                # Words right of the last inferred column are slivers of a
+                # column the scan cuts off (e.g. the first digit of a cropped
+                # Closing Balance, at the page's very edge) or border debris —
+                # they must not be forced into the nearest real column.
+                kept = [
+                    w for w in line["words"]
+                    if w["x0"] <= columns[-1]["x1"] + 12 and not _is_border_noise(w["text"])
+                ]
+                if not kept:
+                    continue
+                line = {"top": line["top"], "words": kept}
+                if kept[0]["x0"] < date_left - 3:
+                    break  # left of the date column: page footer, not table
             prev_top = line["top"]
             cell = assign_line_to_columns(line["words"], columns)
             date_val = cell.get("date", "").strip()
             has_real_date = bool(DATE_PREFIX_RE.match(date_val))
+            if headerless:
+                # with no header to bound the table, a stray date inside
+                # boilerplate/narration text must not start a row
+                has_real_date = has_real_date and bool(
+                    DATE_RE.match(line["words"][0]["text"].strip())
+                )
             # Only debit/credit/amount define a NEW row on a dateless line —
             # deliberately excludes "balance". Confirmed real with an IDBI
             # statement whose running balance sometimes wraps onto its own
@@ -756,63 +941,268 @@ def parse_page_set(all_lines_by_page):
                 REAL_AMOUNT_RE.match(cell.get(k, "").strip())
                 for k in ("debit", "credit", "amount")
             )
-            if has_real_date or (has_txn_amount and rows):
-                row = {
-                    "date": date_val,
-                    "narration": cell.get("narration", "").strip(),
-                    "ref": cell.get("ref", "").strip(),
-                    "debit": clean_amount(cell.get("debit", "")),
-                    "credit": clean_amount(cell.get("credit", "")),
-                    "amount": clean_amount(cell.get("amount", "")),
-                    "balance": clean_amount(cell.get("balance", "")),
-                }
-                if pending_leading["narration"] or pending_leading["ref"]:
-                    for k in ("narration", "ref"):
-                        lead = pending_leading[k].strip()
-                        if lead:
-                            row[k] = (lead + " " + row[k]).strip()
-                    pending_leading = {"narration": "", "ref": ""}
-                rows.append(row)
-                page_added_row = True
-                last_date_top = line["top"]
+            if (
+                has_real_date
+                and not headerless
+                and last_date_x is not None
+                and line["words"][0]["x0"] - last_date_x > 20
+                and not any(
+                    cell.get(k, "").strip()
+                    for k in ("narration", "ref", "debit", "credit", "amount", "balance")
+                )
+            ):
+                # a lone date sitting well right of where row dates start is
+                # a date INSIDE wrapped narration ("... to 30-12-2023"), not
+                # a new transaction
+                cell = {"narration": date_val}
+                has_real_date = False
+            is_start = has_real_date or (has_txn_amount and (rows or started_here))
+            if is_start:
+                started_here = True
+                if has_real_date:
+                    last_date_x = line["words"][0]["x0"]
+            entries.append((line["top"], cell, is_start))
+
+        # ---- Phase 2: build rows. Each dateless run between two row-starts
+        # is split between the row above (trailing) and the row below
+        # (leading) — see _split_dateless_run.
+        page_start_rows = []  # row dicts created on this page, in order
+        start_positions = [i for i, e in enumerate(entries) if e[2]]
+        if not start_positions:
+            continue
+
+        def _new_row(cell):
+            return {
+                "date": cell.get("date", "").strip(),
+                "narration": cell.get("narration", "").strip(),
+                "ref": cell.get("ref", "").strip(),
+                "debit": clean_amount(cell.get("debit", "")),
+                "credit": clean_amount(cell.get("credit", "")),
+                "amount": clean_amount(cell.get("amount", "")),
+                "balance": clean_amount(cell.get("balance", "")),
+            }
+
+        def _append_text(row, cell):
+            for k in ("narration", "ref"):
+                extra = cell.get(k, "").strip()
+                if extra:
+                    row[k] = (row[k] + " " + extra).strip()
+
+        def _prepend_text(row, cell):
+            for k in ("narration", "ref"):
+                extra = cell.get(k, "").strip()
+                if extra:
+                    row[k] = (extra + " " + row[k]).strip()
+
+        def _fill_wrapped_balance(row, cell):
+            if not row["balance"]:
+                extra_balance = clean_amount(cell.get("balance", ""))
+                if extra_balance:
+                    row["balance"] = extra_balance
+
+        page_rows = [_new_row(entries[p][1]) for p in start_positions]
+
+        # lines BEFORE the page's first row-start: only a centre-aligned
+        # layout puts real leading narration there, and it mirrors the row's
+        # own trailing lines (same offsets above and below the dated line).
+        # Anything that doesn't mirror is page header/boilerplate and is left
+        # out — a dateless line before the first row used to be dropped
+        # unconditionally, which stays the default.
+        first_p = start_positions[0]
+        first_top = entries[first_p][0]
+        trail_end = start_positions[1] if len(start_positions) > 1 else len(entries)
+        trailing_block = list(range(first_p + 1, trail_end))
+        # trailing lines of the first row = the ones the run split gives it
+        if len(start_positions) > 1:
+            ktop = _split_dateless_run(
+                first_top,
+                [entries[i][0] for i in trailing_block],
+                entries[start_positions[1]][0],
+            )
+            trailing_block = trailing_block[:ktop]
+        mirrored = []
+        before = list(range(first_p - 1, -1, -1))  # nearest first
+        for n, bi in enumerate(before):
+            if n < len(trailing_block):
+                up = first_top - entries[bi][0]
+                down = entries[trailing_block[n]][0] - first_top
+                if abs(up - down) <= 1.5:
+                    mirrored.append(bi)
+                    continue
+            break
+        # prepend in reading order, so the farthest-from-the-row line ends up first
+        lead_text_cells = [entries[bi][1] for bi in sorted(mirrored)]
+        for c in reversed(lead_text_cells):
+            _prepend_text(page_rows[0], c)
+
+        # runs between consecutive row-starts, and after the last one
+        for si, p in enumerate(start_positions):
+            nxt = start_positions[si + 1] if si + 1 < len(start_positions) else None
+            run_idx = list(range(p + 1, nxt if nxt is not None else len(entries)))
+            if nxt is None:
+                k = len(run_idx)  # nothing follows: all trail the last row
             else:
-                # A dateless line could be a TRAILING continuation of the
-                # row before it (wrapped narration/ref text, and/or a
-                # wrapped balance value — see above), or — confirmed real
-                # with Bank of Baroda — LEADING narration for the row about
-                # to start. Tell them apart by which neighbouring date line
-                # this one actually sits closer to: IDBI/IDFC's genuine
-                # continuation lines always sit much closer to the
-                # preceding date line than to the next transaction's, so
-                # this preserves their existing behaviour unchanged, while
-                # correctly reclassifying Bank of Baroda's leading lines
-                # (which sit closer to the date line still ahead of them).
-                dist_back = (
-                    (line["top"] - last_date_top) if last_date_top is not None else None
+                k = _split_dateless_run(
+                    entries[p][0], [entries[i][0] for i in run_idx], entries[nxt][0]
                 )
-                next_top = _next_date_top(page_lines, idx, columns)
-                dist_fwd = (next_top - line["top"]) if next_top is not None else None
-                is_leading = dist_fwd is not None and (
-                    dist_back is None or dist_fwd < dist_back
-                )
-                if is_leading:
-                    for k in ("narration", "ref"):
-                        extra = cell.get(k, "").strip()
-                        if extra:
-                            pending_leading[k] = (pending_leading[k] + " " + extra).strip()
-                elif rows and page_added_row:
-                    # trailing continuation of the previous row — only when
-                    # that previous row actually started on this same page.
-                    for k in ("narration", "ref"):
-                        extra = cell.get(k, "").strip()
-                        if extra:
-                            rows[-1][k] = (rows[-1][k] + " " + extra).strip()
-                    if not rows[-1]["balance"]:
-                        extra_balance = clean_amount(cell.get("balance", ""))
-                        if extra_balance:
-                            rows[-1]["balance"] = extra_balance
+            for i in run_idx[:k]:
+                _append_text(page_rows[si], entries[i][1])
+                _fill_wrapped_balance(page_rows[si], entries[i][1])
+            lead = run_idx[k:]
+            if nxt is not None:
+                for i in reversed(lead):
+                    _prepend_text(page_rows[si + 1], entries[i][1])
+
+        rows.extend(page_rows)
 
     return columns, rows
+
+
+# ---------------------------------------------------------------------------
+# Header-less tables. A scan (or a page range cut out of a longer statement)
+# can start MID-statement, with no column-header row anywhere in the file —
+# confirmed real with a 43-page scanned HDFC statement that begins at its
+# page 10. With nothing to anchor on, parse_page_set found no table and the
+# freeform fallback turned the page text into 468 garbage rows. When the
+# data itself has an unmistakable grid — dated lines carrying a second (value)
+# date and right-aligned amounts in two or three fixed columns — the columns
+# can be inferred from where those tokens sit instead.
+# ---------------------------------------------------------------------------
+
+def _cluster_by_gap(values, max_gap):
+    """Split sorted numbers into runs where neighbours are <= max_gap apart."""
+    clusters = []
+    for v in sorted(values):
+        if clusters and v - clusters[-1][-1] <= max_gap:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    return clusters
+
+
+def infer_columns_without_header(all_lines_by_page, min_date_lines=6):
+    """Infer a column layout from the data alone, for statements with no
+    header row. Returns the same column dicts find_header_and_columns would
+    ([{type, x0, x1, label, primary}, ...] sorted left to right), or None
+    when the layout isn't unmistakable enough to trust.
+
+    Deliberately narrow: it only fires for the common Indian-bank shape
+    "Date | Narration | [Ref] | Value Date | Debit | Credit | [Balance]",
+    requiring a second date on most dated lines and 2-3 clean right-aligned
+    amount columns. Debit is assumed to be the LEFTMOST amount column and
+    Credit the next one — the near-universal order (and the order on the
+    HDFC statement this was built from, where every row checks out: "NEFT
+    DR-..." sits in the left amount column, "IB FUNDS TRANSFER CR-..." in
+    the right one)."""
+    date_lines = []
+    for page_lines in all_lines_by_page:
+        for line in page_lines:
+            words = line["words"]
+            if words and DATE_RE.match(words[0]["text"].strip()):
+                date_lines.append(words)
+    if len(date_lines) < min_date_lines:
+        return None
+
+    first = [w[0] for w in date_lines]
+    date_x0 = min(w["x0"] for w in first)
+    date_x1 = max(w["x1"] for w in first)
+
+    seconds = []
+    for words in date_lines:
+        for w in words[1:]:
+            if DATE_RE.match(w["text"].strip()):
+                seconds.append(w)
+                break
+    if len(seconds) < 0.6 * len(date_lines):
+        return None
+    vd_x0 = min(w["x0"] for w in seconds)
+    vd_x1 = max(w["x1"] for w in seconds)
+    if vd_x0 <= date_x1:
+        return None
+
+    amounts = []
+    for words in date_lines:
+        for w in words[1:]:
+            if w["x0"] > vd_x1 and REAL_AMOUNT_RE.match(w["text"].strip().replace(",", "")):
+                amounts.append(w)
+    if len(amounts) < min_date_lines:
+        return None
+    clusters = _cluster_by_gap([w["x1"] for w in amounts], 12.0)
+    # fold a stray tiny cluster (OCR jitter on one wide number) into its neighbour
+    minimum = max(3, int(0.05 * len(amounts)))
+    merged = []
+    for c in clusters:
+        if merged and len(c) < minimum:
+            merged[-1].extend(c)
+        elif merged and len(merged[-1]) < minimum:
+            merged[-1].extend(c)
+        else:
+            merged.append(list(c))
+    if not 2 <= len(merged) <= 3:
+        return None
+    amount_types = ["debit", "credit", "balance"][: len(merged)]
+    amount_cols = []
+    for cl, t in zip(merged, amount_types):
+        lo, hi = min(cl), max(cl)
+        members = [w for w in amounts if lo <= w["x1"] <= hi]
+        amount_cols.append({
+            "type": t, "x0": min(w["x0"] for w in members), "x1": hi,
+            "label": t, "primary": True,
+        })
+    # the columns must not overlap each other or the value date
+    prev_x1 = vd_x1
+    for c in amount_cols:
+        if c["x0"] <= prev_x1:
+            return None
+        prev_x1 = c["x1"]
+
+    # narration starts at the first non-date word after the date on dated lines
+    nar_starts = []
+    for words in date_lines:
+        for w in words[1:]:
+            if w["x0"] > date_x1:
+                nar_starts.append(w["x0"])
+                break
+    if not nar_starts:
+        return None
+    nar_x0 = min(nar_starts)
+
+    # optional ref column: long, digit-bearing, right-aligned tokens just left
+    # of the value date (e.g. "0000000000380882", "HDFCH01091172798")
+    refs = []
+    for words in date_lines:
+        for w in words[1:]:
+            t = w["text"].strip()
+            if (
+                len(t) >= 10 and any(ch.isdigit() for ch in t)
+                and w["x1"] < vd_x0 and w["x0"] > nar_x0 + 60
+                and not DATE_RE.match(t)
+            ):
+                refs.append(w)
+    ref_col = None
+    if len(refs) >= 0.4 * len(date_lines):
+        mode_bucket = max(
+            {round(w["x1"] / 6) for w in refs},
+            key=lambda b: sum(1 for w in refs if round(w["x1"] / 6) == b),
+        )
+        members = [w for w in refs if round(w["x1"] / 6) == mode_bucket]
+        ref_col = {
+            "type": "ref", "x0": min(w["x0"] for w in members),
+            "x1": max(w["x1"] for w in members), "label": "ref", "primary": True,
+        }
+
+    nar_x1 = (ref_col["x0"] if ref_col else vd_x0) - 2
+    if nar_x1 <= nar_x0:
+        return None
+    columns = [
+        {"type": "date", "x0": date_x0, "x1": date_x1, "label": "date", "primary": True},
+        {"type": "narration", "x0": nar_x0, "x1": nar_x1, "label": "narration", "primary": True},
+    ]
+    if ref_col:
+        columns.append(ref_col)
+    columns.append({"type": "date", "x0": vd_x0, "x1": vd_x1, "label": "value date", "primary": False})
+    columns.extend(amount_cols)
+    return sorted(columns, key=lambda c: c["x0"])
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +1330,20 @@ def parse_freeform_lines(all_lines_by_page):
 # API
 # ---------------------------------------------------------------------------
 
+def _rows_without_amount_warning(rows):
+    """Warn when some rows came out with no debit/credit/amount at all —
+    on a scanned statement OCR occasionally drops a short amount outright
+    (confirmed real: "1.00" and "2.84" on a scanned HDFC statement), which
+    would otherwise leave a silently incomplete transaction in the Excel."""
+    n = sum(1 for r in rows if not (r["debit"] or r["credit"] or r["amount"]))
+    if n == 0:
+        return []
+    return [
+        f"{n} transaction row(s) have no amount — the scan may have been too "
+        "faint to read; please check those rows against the original statement."
+    ]
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -978,11 +1382,36 @@ async def extract(
 
         if columns is not None:
             detected_columns = [c["type"] for c in columns]
-            return {
+            result = {
                 "columns": detected_columns,
                 "row_count": len(rows),
                 "rows": rows,
             }
+            warnings = _rows_without_amount_warning(rows)
+            if warnings:
+                result["warnings"] = warnings
+            return result
+
+        # No header row anywhere (e.g. a scan that starts mid-statement):
+        # try to infer the column grid from the data itself.
+        inferred = infer_columns_without_header(lines_by_page)
+        if inferred is not None:
+            columns, rows = parse_page_set(lines_by_page, columns_override=inferred)
+            if len(rows) >= 2:
+                warnings = [
+                    "No column-heading row was found in this file, so the "
+                    "columns were inferred from the layout (Debit = left "
+                    "amount column, Credit = right amount column)."
+                ]
+                if "balance" not in [c["type"] for c in columns]:
+                    warnings.append("No Balance column was found in this file.")
+                warnings += _rows_without_amount_warning(rows)
+                return {
+                    "columns": [c["type"] for c in columns],
+                    "row_count": len(rows),
+                    "rows": rows,
+                    "warnings": warnings,
+                }
 
         # No aligned table header found — some mobile-app-exported "mini
         # statements" list one transaction per line instead of a proper
