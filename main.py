@@ -118,7 +118,7 @@ COLUMN_KEYWORDS = {
 }
 
 DATE_RE = re.compile(
-    r"^\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}$"
+    r"^(\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}|\d{4}-\d{2}-\d{2})$"
 )
 # Same shape as DATE_RE but without the end anchor — a real IDBI statement
 # prints a transaction time right after the date IN THE SAME cell ("Txn
@@ -129,7 +129,7 @@ DATE_RE = re.compile(
 # (date + time together), this just recognizes it as a real date so the row
 # isn't dropped or wrongly merged into the previous one.
 DATE_PREFIX_RE = re.compile(
-    r"^\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}"
+    r"^(\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}|\d{4}-\d{2}-\d{2})"
 )
 TIME_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
 AMOUNT_RE = re.compile(r"^[\d,]+\.\d{2}$|^[\d,]+$")
@@ -185,6 +185,101 @@ def _pages_have_text_layer(pdf_path, password):
     if pages and pages[-1].strip() == "":
         pages = pages[:-1]  # pdftotext ends with a trailing form feed
     return [sum(1 for ch in p if not ch.isspace()) >= 20 for p in pages]
+
+
+# A narrow Date column makes some banks (a real IndusInd statement) wrap the
+# date itself onto two lines — "2026-" on the transaction's line and "07-31"
+# on the next line — and when the row sits at the bottom of a page the second
+# half can land at the TOP of the next page, right under the repeated table
+# header. Neither half is a date on its own, so no row ever starts and the
+# statement comes out empty (or nearly). This runs on the extracted words,
+# before any line grouping, and glues each date-prefix word to the matching
+# fragment directly below it in the same x position (or, for the last row on
+# a page, the first matching fragment at the top of the next page).
+_SPLIT_DATE_PREFIX_RE = re.compile(
+    r"^(\d{4}[-/]|\d{1,2}[-/](\d{1,2}|[A-Za-z]{3,9})[-/])$"
+)
+SPLIT_DATE_MAX_DROP = 30.0  # fragment must be this close below its prefix
+
+
+def _join_split_dates(pages_words):
+    def _fits(prefix, frag):
+        return bool(DATE_RE.match(prefix["text"] + frag["text"]))
+
+    def _find_below(page_words, p, consumed):
+        best = None
+        for w in page_words:
+            if id(w) in consumed or w is p:
+                continue
+            if abs(w["x0"] - p["x0"]) > 3.0:
+                continue
+            drop = w["top"] - p["top"]
+            if drop <= 0 or drop > SPLIT_DATE_MAX_DROP:
+                continue
+            if not _fits(p, w):
+                continue
+            if best is None or drop < best["top"] - p["top"]:
+                best = w
+        return best
+
+    consumed = set()
+    removals = {}  # page index -> set(id(word))
+    joined = {}  # id(prefix word) -> fragment word
+    for pi, pw in enumerate(pages_words):
+        if not pw:
+            continue
+        prefixes = [w for w in pw if _SPLIT_DATE_PREFIX_RE.match(w["text"])]
+        prefixes.sort(key=lambda w: w["top"])
+        for p in prefixes:
+            frag = _find_below(pw, p, consumed)
+            frag_page = pi
+            if frag is None and pi + 1 < len(pages_words) and pages_words[pi + 1]:
+                # only the LAST prefix on the page may continue on the next
+                # page, and only with a fragment that sits above every
+                # prefix of that next page (i.e. before its first row)
+                if p is prefixes[-1]:
+                    nxt = pages_words[pi + 1]
+                    next_prefix_tops = [
+                        w["top"] for w in nxt if _SPLIT_DATE_PREFIX_RE.match(w["text"])
+                    ]
+                    limit = min(next_prefix_tops) if next_prefix_tops else None
+                    cands = [
+                        w
+                        for w in nxt
+                        if id(w) not in consumed
+                        and abs(w["x0"] - p["x0"]) <= 3.0
+                        and _fits(p, w)
+                        and (limit is None or w["top"] < limit)
+                    ]
+                    if cands:
+                        frag = min(cands, key=lambda w: w["top"])
+                        frag_page = pi + 1
+            if frag is None:
+                continue
+            consumed.add(id(frag))
+            joined[id(p)] = frag
+            removals.setdefault(frag_page, set()).add(id(frag))
+    if not joined:
+        return pages_words
+    out = []
+    for pi, pw in enumerate(pages_words):
+        if not pw:
+            out.append(pw)
+            continue
+        drop = removals.get(pi, set())
+        new = []
+        for w in pw:
+            if id(w) in drop:
+                continue
+            if id(w) in joined:
+                f = joined[id(w)]
+                w = dict(w)
+                w["text"] = w["text"] + f["text"]
+                w["x1"] = max(w["x1"], w["x0"] + (f["x1"] - f["x0"]) + (w["x1"] - w["x0"]))
+            new.append(w)
+        out.append(new)
+    return out
+
 
 
 def extract_pages_words(pdf_path: str, password: Optional[str], progress=None):
@@ -306,7 +401,7 @@ def extract_pages_words(pdf_path: str, password: Optional[str], progress=None):
             for i in needs_ocr_pages:
                 pages_words[i] = _ocr_one_page(i)
 
-    return pages_words
+    return _join_split_dates(pages_words)
 
 
 def group_into_lines(words, y_tolerance=3.0):
@@ -643,6 +738,8 @@ def assign_line_to_columns(line_words, columns):
         for i, c in enumerate(columns)
     ]
     cells = {k: [] for k in key_for}
+    prev_idx = None
+    prev_x1 = None
     for w in line_words:
         # Fix a comma-for-decimal-point rendering glitch (see
         # _normalize_amount_token) before any shape check runs, so both the
@@ -663,6 +760,24 @@ def assign_line_to_columns(line_words, columns):
             or (columns[idx]["type"] == "date" and not _looks_like_date_or_time_word(text))
         ):
             idx += 1
+        # A narration that runs on past its own header label (the header is
+        # usually much narrower than the data, see above) can reach into a
+        # following text column — confirmed real with an IndusInd statement,
+        # whose "...TFS YAMUNA AIRPORT" narration put "AIRPORT" in the Ref No
+        # cell. A word that starts clearly LEFT of that column's own header
+        # label, and sits one normal word-space after a narration word, is
+        # the same sentence continuing, not the start of the ref value.
+        if (
+            idx > 0
+            and prev_idx == idx - 1
+            and columns[idx]["type"] == "ref"
+            and columns[idx - 1]["type"] == "narration"
+            and prev_x1 is not None
+            and w["x0"] - prev_x1 <= 6.0
+            and w["x0"] < columns[idx]["x0"] - 4.0
+        ):
+            idx -= 1
+        prev_idx, prev_x1 = idx, w["x1"]
         cells[key_for[idx]].append(text)
     return {t: " ".join(v).strip() for t, v in cells.items()}
 
@@ -857,6 +972,7 @@ def parse_page_set(all_lines_by_page, columns_override=None):
     headerless = columns_override is not None
     rows = []
     last_date_x = None  # x of the most recent row-start date (see Phase 1)
+    tall_gap_limit = None  # widened footer guard for tall-row layouts (see below)
 
     for page_lines in all_lines_by_page:
         start_idx = 0
@@ -903,6 +1019,30 @@ def parse_page_set(all_lines_by_page, columns_override=None):
 
         date_left = columns[0]["x0"]
 
+        # MAX_ROW_LINE_GAP assumes the lines of a table sit close together.
+        # A statement laid out with tall, airy rows (a real IndusInd one puts
+        # ~56pt between consecutive transactions, with the wrapped date
+        # half-way between) would trip that footer guard after its very
+        # first row and come out with 1-3 transactions. The guard is only
+        # known to be wrong when a big gap is REPEATEDLY followed by a new
+        # dated row — between two real rows — so only then (2+ such gaps on
+        # a page, remembered for later pages, which may hold a single row)
+        # is it scaled to the observed gaps. Ordinary statements, whose
+        # lines are all closer than the guard, never trigger this and keep
+        # the original limit exactly.
+        tall_gaps = []
+        _tops = [ln for ln in page_lines[start_idx:] if ln["words"]]
+        for a, b in zip(_tops, _tops[1:]):
+            if (
+                b["top"] - a["top"] > MAX_ROW_LINE_GAP
+                and DATE_RE.match(b["words"][0]["text"].strip())
+                and abs(b["words"][0]["x0"] - date_left) <= 15
+            ):
+                tall_gaps.append(b["top"] - a["top"])
+        if len(tall_gaps) >= 2:
+            tall_gap_limit = max(tall_gap_limit or 0.0, 1.5 * max(tall_gaps))
+        gap_limit = max(MAX_ROW_LINE_GAP, tall_gap_limit or 0.0)
+
         # ---- Phase 1: walk the page's table lines, classify each as the
         # start of a new row or a dateless (wrapped narration / balance) line.
         entries = []  # (top, cell, is_start)
@@ -926,8 +1066,21 @@ def parse_page_set(all_lines_by_page, columns_override=None):
                 continue
             if PAGE_FOOTER_RE.match(_line_text(line)):
                 break  # page-number footer: nothing after it is table
-            if prev_top is not None and line["top"] - prev_top > MAX_ROW_LINE_GAP:
+            if prev_top is not None and line["top"] - prev_top > gap_limit:
                 break  # end of the transaction table for this page — the rest is footer/disclaimer text
+            if (
+                gap_limit > MAX_ROW_LINE_GAP
+                and prev_top is not None
+                and line["top"] - prev_top > MAX_ROW_LINE_GAP
+                and not DATE_RE.match(line["words"][0]["text"].strip())
+                and not any(REAL_AMOUNT_RE.match(w["text"].strip()) for w in line["words"])
+            ):
+                # In a tall-row layout the guard was widened (see gap_limit),
+                # so a big gap alone no longer proves the table ended. But
+                # only a new dated/amount line may follow one — a dateless,
+                # amount-free line after a large gap is the page footer
+                # (disclaimer text), never a wrapped narration line.
+                break
             if headerless:
                 # Words right of the last inferred column are slivers of a
                 # column the scan cuts off (e.g. the first digit of a cropped
