@@ -118,7 +118,7 @@ COLUMN_KEYWORDS = {
 }
 
 DATE_RE = re.compile(
-    r"^(\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}|\d{4}-\d{2}-\d{2})$"
+    r"^(\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})$"
 )
 # Same shape as DATE_RE but without the end anchor — a real IDBI statement
 # prints a transaction time right after the date IN THE SAME cell ("Txn
@@ -129,7 +129,7 @@ DATE_RE = re.compile(
 # (date + time together), this just recognizes it as a real date so the row
 # isn't dropped or wrongly merged into the previous one.
 DATE_PREFIX_RE = re.compile(
-    r"^(\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}|\d{4}-\d{2}-\d{2})"
+    r"^(\d{1,2}[-/. ]([A-Za-z]{3,9}|\d{1,2})[-/. ]\d{2,4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})"
 )
 TIME_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
 AMOUNT_RE = re.compile(r"^[\d,]+\.\d{2}$|^[\d,]+$")
@@ -925,6 +925,12 @@ PAGE_FOOTER_RE = re.compile(
 )
 
 
+CARRY_OVER_RE = re.compile(
+    r"^\s*(contd|continued|brought\s+forward|carried\s+forward|b\s*/\s*f|c\s*/\s*f|opening\s+balance|closing\s+balance|balance\s+(b/f|c/f|forward))",
+    re.IGNORECASE,
+)
+
+
 def _line_text(line):
     return " ".join(w["text"] for w in line["words"]).strip()
 
@@ -1216,6 +1222,30 @@ def parse_page_set(all_lines_by_page, columns_override=None):
         lead_text_cells = [entries[bi][1] for bi in sorted(mirrored)]
         for c in reversed(lead_text_cells):
             _prepend_text(page_rows[0], c)
+
+        # A row that is the LAST on a page can have its wrapped narration
+        # tail printed at the top of the NEXT page, under the repeated
+        # header (confirmed real: an IndusInd statement, "UPI/.../Sidd/..."
+        # on page 2 with "/Siddharth Takkar" on page 3). Those lines sit
+        # before this page's first row-start and don't mirror it, so they
+        # used to be dropped. Give them back to the previous page's last
+        # row — but only plain narration/ref text: anything carrying a
+        # date or an amount (an opening/brought-forward balance line) or
+        # reading like carry-over boilerplate stays out.
+        if rows and not headerless:
+            mirrored_set = set(mirrored)
+            for bi in range(first_p):
+                if bi in mirrored_set:
+                    continue
+                c = entries[bi][1]
+                if (
+                    c.get("date", "").strip()
+                    or any(c.get(k, "").strip() for k in ("debit", "credit", "amount", "balance"))
+                    or not (c.get("narration", "").strip() or c.get("ref", "").strip())
+                    or CARRY_OVER_RE.match(c.get("narration", "").strip())
+                ):
+                    continue
+                _append_text(rows[-1], c)
 
         # runs between consecutive row-starts, and after the last one
         for si, p in enumerate(start_positions):
